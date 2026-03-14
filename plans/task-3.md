@@ -228,12 +228,25 @@ Add 2 regression tests:
 
 ### After Fixes
 
-**Best Score: 8/10 passed**
+**Best Score: 8/10 local passed**
 
-**Remaining Failures:**
+**Remaining Failures (local):**
 
 - Question 4 (intermittent): LLM sometimes stops early with "Let me continue checking..."
-- Question 9: LLM produces incomplete answer ("Let me check...") for complex multi-file reasoning
+- Question 9: LLM produces incomplete answer for complex multi-file reasoning
+
+**Hidden Eval Failures (autochecker):**
+
+- Question 14: Count learners from `/learners/` - FIXED: Added Data Counting instructions
+- Question 16: Find risky operations in analytics.py - FIXED: Added Bug Detection instructions
+- Question 18: Compare ETL vs API error handling - FIXED: Added Error Handling Analysis instructions
+
+**Latest Improvements:**
+
+- Added "Data Counting" section: Instructs agent to count API list results
+- Added "Bug Detection" section: Look for division operations, None-unsafe sorted()
+- Added "Error Handling Analysis": Compare try/except, idempotency checks
+- Improved guidelines for counting, bug, and comparison questions
 
 **Diagnosis:**
 
@@ -242,6 +255,7 @@ Add 2 regression tests:
 - Increased MAX_TOOL_CALLS from 10 to 15 to allow more iterations
 - Updated system prompt to emphasize complete answers
 - LLM behavior is somewhat non-deterministic - same question may pass or fail
+- Hidden eval tests more complex reasoning that requires better prompt guidance
 
 ## Dependencies
 
