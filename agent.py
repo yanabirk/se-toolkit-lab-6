@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Agent CLI - Calls an LLM with tools to answer questions using the project wiki.
+Agent CLI - Calls an LLM with tools to answer questions using wiki, source code, and live API.
 
 Usage:
     uv run agent.py "Your question here"
@@ -10,6 +10,7 @@ Output:
 """
 
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Any
@@ -22,30 +23,36 @@ from pydantic import BaseModel
 
 
 class AgentSettings(BaseModel):
-    """Configuration loaded from .env.agent.secret."""
+    """Configuration loaded from .env.agent.secret and .env.docker.secret."""
 
     llm_api_key: str
     llm_api_base: str
     llm_model: str = "qwen3-coder-plus"
+    lms_api_key: str = ""  # Loaded from .env.docker.secret
+    agent_api_base_url: str = "http://localhost:42002"  # Backend API URL
 
 
 def load_settings() -> AgentSettings:
-    """Load and validate agent configuration."""
-    env_file = Path(__file__).parent / ".env.agent.secret"
-    if not env_file.exists():
-        print(f"Error: {env_file} not found", file=sys.stderr)
-        print("Run: cp .env.agent.example .env.agent.secret", file=sys.stderr)
-        sys.exit(1)
+    """Load and validate agent configuration from multiple env files."""
+    # Load LLM config from .env.agent.secret
+    agent_env_file = Path(__file__).parent / ".env.agent.secret"
+    if agent_env_file.exists():
+        load_dotenv(agent_env_file)
 
-    load_dotenv(env_file)
-
-    import os
+    # Load LMS API key from .env.docker.secret
+    docker_env_file = Path(__file__).parent / ".env.docker.secret"
+    if docker_env_file.exists():
+        load_dotenv(docker_env_file, override=False)
 
     try:
         return AgentSettings(
             llm_api_key=os.environ["LLM_API_KEY"],
             llm_api_base=os.environ["LLM_API_BASE"],
             llm_model=os.environ.get("LLM_MODEL", "qwen3-coder-plus"),
+            lms_api_key=os.environ.get("LMS_API_KEY", ""),
+            agent_api_base_url=os.environ.get(
+                "AGENT_API_BASE_URL", "http://localhost:42002"
+            ),
         )
     except KeyError as e:
         print(f"Error: Missing environment variable {e}", file=sys.stderr)
@@ -104,10 +111,65 @@ def tool_list_files(path: str) -> str:
         return f"Error: {e}"
 
 
+def tool_query_api(
+    method: str,
+    path: str,
+    body: str | None = None,
+    settings: AgentSettings | None = None,
+) -> str:
+    """Call the backend API with LMS_API_KEY authentication."""
+    if settings is None:
+        settings = load_settings()
+
+    if not settings.lms_api_key:
+        return "Error: LMS_API_KEY not configured. Set it in .env.docker.secret."
+
+    base_url = settings.agent_api_base_url
+    url = f"{base_url}{path}"
+    headers = {
+        "Authorization": f"Bearer {settings.lms_api_key}",
+        "Content-Type": "application/json",
+    }
+
+    print(f"Calling API: {method} {url}", file=sys.stderr)
+
+    try:
+        with httpx.Client(timeout=30.0) as client:
+            if method.upper() == "GET":
+                response = client.get(url, headers=headers)
+            elif method.upper() == "POST":
+                data = json.loads(body) if body else {}
+                response = client.post(url, headers=headers, json=data)
+            elif method.upper() == "PUT":
+                data = json.loads(body) if body else {}
+                response = client.put(url, headers=headers, json=data)
+            elif method.upper() == "DELETE":
+                response = client.delete(url, headers=headers)
+            elif method.upper() == "PATCH":
+                data = json.loads(body) if body else {}
+                response = client.patch(url, headers=headers, json=data)
+            else:
+                return f"Error: Unsupported method: {method}"
+
+            result = {
+                "status_code": response.status_code,
+                "body": response.text,
+            }
+            return json.dumps(result)
+
+    except httpx.TimeoutException:
+        return f"Error: API request timed out after 30 seconds"
+    except httpx.ConnectError as e:
+        return f"Error: Cannot connect to API at {url}: {e}"
+    except Exception as e:
+        return f"Error: {e}"
+
+
 # Tool registry
 TOOLS = {
     "read_file": tool_read_file,
     "list_files": tool_list_files,
+    "query_api": tool_query_api,
 }
 
 
@@ -151,47 +213,97 @@ def get_tool_schemas() -> list[dict[str, Any]]:
                 },
             },
         },
+        {
+            "type": "function",
+            "function": {
+                "name": "query_api",
+                "description": "Call the backend API and return the response. Use this for live data (item counts, scores), API behavior (status codes), testing endpoints, or checking analytics.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "method": {
+                            "type": "string",
+                            "description": "HTTP method (GET, POST, PUT, DELETE, PATCH)",
+                            "enum": ["GET", "POST", "PUT", "DELETE", "PATCH"],
+                        },
+                        "path": {
+                            "type": "string",
+                            "description": "API path (e.g., '/items/', '/analytics/completion-rate')",
+                        },
+                        "body": {
+                            "type": "string",
+                            "description": "Optional JSON request body (for POST/PUT/PATCH)",
+                        },
+                    },
+                    "required": ["method", "path"],
+                },
+            },
+        },
     ]
 
 
 # === System Prompt ===
 
-SYSTEM_PROMPT = """You are a documentation agent that answers questions using the project wiki.
+SYSTEM_PROMPT = """You are a documentation and system agent that answers questions using:
+1. Project wiki (via list_files and read_file)
+2. Source code (via read_file)
+3. Live backend API (via query_api)
 
 Tools available:
 - list_files(path): List files and directories in a directory
-- read_file(path): Read the contents of a file
+- read_file(path): Read the contents of a file from the project
+- query_api(method, path, body): Call the backend API and return the response. The API key is automatically included.
+
+Tool selection guide:
+- Use list_files/read_file for: wiki documentation, source code, configuration files (docker-compose.yml, Dockerfile, etc.)
+- Use query_api for: live data (item counts, scores), API behavior (status codes, error messages), testing endpoints, checking analytics
 
 Process:
-1. Use list_files to discover wiki files if you're not sure where to look
-2. Use read_file to read relevant wiki sections and find the answer
-3. Include the source reference in your answer (format: wiki/filename.md#section-anchor)
+1. For wiki questions → use list_files to discover wiki files, then read_file to find the answer
+2. For source code questions → use read_file on backend/ files or configuration files
+3. For live data questions → use query_api to query the running API
+4. For API behavior questions → use query_api to test endpoints (e.g., check status codes)
+5. For bug diagnosis → use query_api to see the error, then read_file to examine the source code
+
+API Authentication Knowledge:
+- The backend API requires authentication via Bearer token (LMS_API_KEY)
+- Requests without authentication typically return HTTP 401 (Unauthorized) or 403 (Forbidden)
+- When asked about unauthenticated requests, you can infer that 401/403 would be returned
 
 Guidelines:
 - Only make necessary tool calls - don't over-use tools
-- If you know the answer directly, you can respond without using tools
-- Always provide a source reference with your answer when you use tools
-- The source should be in format: wiki/filename.md#section-name
+- Always provide a source reference when using read_file (format: path/to/file.md#section-anchor)
+- For query_api results, mention the endpoint queried
+- The source field should reference the file path when using read_file (e.g., wiki/git-workflow.md)
+- For query_api answers, source can be empty or mention the endpoint
+- IMPORTANT: Always give complete, final answers - never say "let me check" or "I need to" without actually completing the thought
+- When you've gathered enough information, provide a comprehensive final answer
+- Don't leave answers hanging - finish your explanation
 
 When providing a source reference:
-- Use the file path (e.g., wiki/git-workflow.md)
+- Use the file path (e.g., wiki/git-workflow.md, backend/app/routers/items.py)
 - Add a section anchor if applicable (e.g., #resolving-merge-conflicts)
-- Format: wiki/filename.md#section-name
+- Format: path/to/file.md#section-name
 """
 
 
 # === Agentic Loop ===
 
-MAX_TOOL_CALLS = 10
+MAX_TOOL_CALLS = 15
 
 
-def execute_tool(tool_name: str, args: dict[str, Any]) -> str:
+def execute_tool(
+    tool_name: str, args: dict[str, Any], settings: AgentSettings | None = None
+) -> str:
     """Execute a tool and return the result."""
     if tool_name not in TOOLS:
         return f"Error: Unknown tool: {tool_name}"
 
     try:
         func = TOOLS[tool_name]
+        # Pass settings to query_api
+        if tool_name == "query_api":
+            return func(**args, settings=settings)
         return func(**args)
     except Exception as e:
         return f"Error executing {tool_name}: {e}"
@@ -269,7 +381,8 @@ def run_agentic_loop(
 
         if not tool_calls:
             # No tool calls - this is the final answer
-            answer = message.get("content", "")
+            # Use 'or ""' because content can be null (not just missing)
+            answer = message.get("content") or ""
             print(f"Answer: {answer}", file=sys.stderr)
 
             # Try to extract source from answer if not already set
@@ -295,7 +408,7 @@ def run_agentic_loop(
             print(f"Executing tool: {tool_name}({tool_args})", file=sys.stderr)
 
             # Execute the tool
-            result = execute_tool(tool_name, tool_args)
+            result = execute_tool(tool_name, tool_args, settings)
 
             # Record the tool call
             tool_call_record = {
@@ -308,7 +421,8 @@ def run_agentic_loop(
             # Track source from read_file calls
             if tool_name == "read_file" and "Error" not in result:
                 path_arg = tool_args.get("path", "")
-                if path_arg.startswith("wiki/"):
+                # Track any file reference, not just wiki/
+                if path_arg.endswith((".md", ".py", ".yml", ".yaml", ".json", ".txt")):
                     last_source = path_arg
 
             # Add tool result to message history
